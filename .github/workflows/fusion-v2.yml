@@ -1,0 +1,344 @@
+name: "⚡🔐✋ Fusion V2 — Ultra High-Performance Windows Fortress"
+
+on:
+  workflow_dispatch:
+    inputs:
+      RUNNER_TIER:
+        description: "Execution Infrastructure"
+        required: true
+        type: choice
+        default: "Standard-ARM64-Windows11"
+        options:
+          - "Standard-x64-Windows2025"      # 4 vCPU x64  / 16 GB  (fastest x64, free)
+          - "Standard-ARM64-Windows11"      # 4 vCPU ARM64 / 16 GB (public repos, free)
+          - "Standard-x64-Windows2022"      # 4 vCPU x64  / 16 GB  (legacy compat)
+          - "Preview-ARM64-VS2026"          # 4 vCPU ARM64 / 16 GB (VS 2026 image)
+      INSTANCE:
+        description: "Instance number to deploy"
+        required: true
+        default: "1"
+      COMMAND_PAYLOAD:
+        description: "Optional Base64-encoded PowerShell payload (runs after fortress is online)"
+        required: false
+        default: ""
+      FAIL_FAST:
+        description: "Halt immediately on payload error"
+        required: false
+        type: boolean
+        default: true
+  repository_dispatch:
+    types: [fusion-relay]
+
+permissions:
+  contents: write        # required for relay dispatch
+
+concurrency:
+  group: fusion-fleet
+  cancel-in-progress: false
+
+jobs:
+  fortress-execute:
+    name: "⚡ Fortress [${{ github.event.inputs.RUNNER_TIER || github.event.client_payload.profile || 'Standard-ARM64-Windows11' }}] — Instance ${{ github.event.inputs.INSTANCE || github.event.client_payload.instance || '1' }}"
+    timeout-minutes: 350
+
+    # ── Zero-latency dynamic routing (no resolver VM) ──
+    # For paid Larger Runners (real 64 vCPU), add a tier mapping to your pool label, e.g.:
+    #   (... == 'Enterprise-x64-64Core' && fromJSON('["self-hosted","windows","x64","64-core"]')) ||
+    runs-on: >-
+      ${{
+        ((github.event.inputs.RUNNER_TIER || github.event.client_payload.profile) == 'Standard-x64-Windows2025' && 'windows-2025') ||
+        ((github.event.inputs.RUNNER_TIER || github.event.client_payload.profile) == 'Standard-ARM64-Windows11' && 'windows-11-arm') ||
+        ((github.event.inputs.RUNNER_TIER || github.event.client_payload.profile) == 'Standard-x64-Windows2022' && 'windows-2022') ||
+        'windows-11-vs2026-arm'
+      }}
+
+    defaults:
+      run:
+        shell: pwsh
+
+    env:
+      EFFECTIVE_TIER: ${{ github.event.inputs.RUNNER_TIER || github.event.client_payload.profile || 'Standard-ARM64-Windows11' }}
+      INSTANCE_ID: ${{ github.event.inputs.INSTANCE || github.event.client_payload.instance || '1' }}
+      RAW_PAYLOAD: ${{ github.event.inputs.COMMAND_PAYLOAD }}
+      FAIL_FAST_INPUT: ${{ github.event.inputs.FAIL_FAST }}
+      NGROK_SHAHZAIB: ${{ secrets.NGROK_SHAHZAIB }}
+      NGROK_TCP_ADDR: ${{ secrets.NGROK_TCP_ADDR }}     # optional: reserved TCP address
+      NGROK_ALLOW_IP: ${{ secrets.NGROK_ALLOW_IP }}     # optional: your IP/CIDR lockdown
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      DEPLOYMENT_ID: ${{ github.run_id }}
+      FAST_SCRATCH: "D:\\fusion-scratch"
+
+    steps:
+      - name: 🛡️ Security Sanitization & Secret Masking
+        run: |
+          foreach ($v in @($env:NGROK_SHAHZAIB, $env:TELEGRAM_BOT_TOKEN, $env:RAW_PAYLOAD)) {
+            if (-not [string]::IsNullOrWhiteSpace($v)) { Write-Host "::add-mask::$v" }
+          }
+          if ([string]::IsNullOrWhiteSpace($env:NGROK_SHAHZAIB)) {
+            Write-Error "❌ Missing required secret: NGROK_SHAHZAIB"; exit 1
+          }
+          Write-Host "✔ Secrets validated and masked."
+
+      - name: 🚀 OS, Storage & Kernel Performance Tuning
+        run: |
+          $ErrorActionPreference = 'SilentlyContinue'
+          Write-Host "--- Applying maximum-performance profile ---"
+
+          # 1. Thread priority
+          [System.Diagnostics.Process]::GetCurrentProcess().PriorityClass = 'High'
+
+          # 2. Ultimate Performance power plan (fallback: High Performance)
+          powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 | Out-Null
+          powercfg /s e9a42b02-d5df-448d-aa00-03f14749eb61 2>$null
+          if ($LASTEXITCODE -ne 0) { powercfg /s 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c }
+          powercfg /change monitor-timeout-ac 0; powercfg /change standby-timeout-ac 0
+
+          # 3. Defender real-time scan bypass (frees CPU + disk I/O on ephemeral runner)
+          Set-MpPreference -DisableRealtimeMonitoring $true -ExclusionPath "C:\","D:\" 2>$null
+
+          # 4. Windows Update suppression (prevents mid-mission reboot)
+          Stop-Service wuauserv -Force; Set-Service wuauserv -StartupType Disabled
+
+          # 5. Redirect TEMP/TMP to high-IOPS NVMe scratch (D:) when present
+          if (Test-Path "D:\") {
+            New-Item -ItemType Directory -Path $env:FAST_SCRATCH -Force | Out-Null
+            "TEMP=$env:FAST_SCRATCH" >> $env:GITHUB_ENV
+            "TMP=$env:FAST_SCRATCH"  >> $env:GITHUB_ENV
+            Write-Host "✔ Scratch I/O relocated to NVMe: $env:FAST_SCRATCH"
+          }
+
+          # 6. Trim telemetry/consumer services + startup bloat
+          foreach ($svc in "DiagTrack","dmwappushservice","RetailDemo") {
+            Stop-Service $svc -Force; Set-Service $svc -StartupType Disabled
+          }
+          New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" -Force | Out-Null
+          Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" -Name "DisableWindowsConsumerFeatures" -Value 1
+
+          # 7. TLS hardening
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+          Write-Host "✔ Kernel, storage, and network stack tuned."
+
+      - name: 📊 Hypervisor & Hardware Capability Audit
+        run: |
+          Write-Host "================ REAL ENVIRONMENT TELEMETRY ================"
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+          $os  = Get-CimInstance Win32_OperatingSystem
+          $cs  = Get-CimInstance Win32_ComputerSystem
+          $diskC = Get-PSDrive C
+          $diskD = Get-PSDrive D -ErrorAction SilentlyContinue
+          Write-Host "Tier Requested         : $env:EFFECTIVE_TIER"
+          Write-Host "Processor              : $($cpu.Name)"
+          Write-Host "Architecture           : $env:PROCESSOR_ARCHITECTURE"
+          Write-Host "Physical Cores         : $($cpu.NumberOfCores)"
+          Write-Host "Logical vCPUs          : $($cs.NumberOfLogicalProcessors)"
+          Write-Host "RAM                    : $([math]::Round($os.FreePhysicalMemory/1MB,2)) GB free / $([math]::Round($cs.TotalPhysicalMemory/1GB,2)) GB total"
+          Write-Host "OS                     : $($os.Caption) (Build $($os.BuildNumber))"
+          Write-Host "Disk C:                : $([math]::Round($diskC.Free/1GB,2)) GB free"
+          if ($diskD) { Write-Host "Disk D: (NVMe scratch) : $([math]::Round($diskD.Free/1GB,2)) GB free" }
+          Write-Host "============================================================"
+
+      - name: 🔐 RDP Access Provisioning
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $RdpUser = "FabricAdmin"; $RdpPassword = "A123456!"
+          $secPass = ConvertTo-SecureString $RdpPassword -AsPlainText -Force
+          if (Get-LocalUser -Name $RdpUser -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name $RdpUser -Password $secPass -PasswordNeverExpires:$true
+          } else {
+            New-LocalUser -Name $RdpUser -Password $secPass -FullName "Fusion Operator" `
+              -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member $RdpUser -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $RdpUser -ErrorAction SilentlyContinue
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 1
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-Service TermService -StartupType Automatic
+          Restart-Service TermService -Force
+          Write-Host "✔ RDP enabled for '$RdpUser'"
+
+      - name: 🌐 Tunnel Engine — Verified Fetch + Deploy
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ngrokDir = "C:\Fusion\ngrok"
+          New-Item -ItemType Directory -Force -Path $ngrokDir,"C:\Fusion\Logs" | Out-Null
+
+          # Resilient curl transport (HTTP/2, auto-reconnect, 5 retries)
+          $zip = "$ngrokDir\ngrok.zip"
+          & curl.exe --silent --show-error --location --retry 5 --retry-delay 3 --retry-connrefused `
+              --retry-max-time 180 --connect-timeout 30 `
+              -o $zip "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
+          if ($LASTEXITCODE -ne 0) { throw "ngrok download failed (exit $LASTEXITCODE)" }
+          Expand-Archive $zip -DestinationPath $ngrokDir -Force; Remove-Item $zip -Force
+
+          # Supply-chain integrity: Authenticode signature must be valid + issued to ngrok
+          $sig = Get-AuthenticodeSignature "$ngrokDir\ngrok.exe"
+          if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notmatch "ngrok") {
+            throw "❌ ngrok.exe signature FAILED verification (Status: $($sig.Status)) — aborting"
+          }
+          Write-Host "✔ ngrok.exe signature verified: $($sig.SignerCertificate.Subject)"
+
+          # Config with optional IP-allowlist lockdown (Zero-Trust pattern)
+          $cfg = "version: 3`nagent:`n  authtoken: $env:NGROK_SHAHZAIB"
+          if (-not [string]::IsNullOrWhiteSpace($env:NGROK_ALLOW_IP)) {
+            $cfg += "`nendpoints:`n- name: rdp`n  upstream:`n    url: 3389`n  traffic_policy:`n    on_tcp_connect:`n    - actions:`n      - type: restrict-ips`n        config:`n          allow:`n          - $env:NGROK_ALLOW_IP"
+          }
+          $cfg | Out-File "$ngrokDir\ngrok.yml" -Encoding ascii
+          & "$ngrokDir\ngrok.exe" --version
+          Write-Host "✔ Tunnel engine staged."
+
+      - name: ⚡ Fortress Online — Tunnel + Watchdog + Mission Loop
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $ngrokExe = "C:\Fusion\ngrok\ngrok.exe"; $ngrokYml = "C:\Fusion\ngrok\ngrok.yml"
+          $ngrokLog = "C:\Fusion\ngrok\ngrok.log"
+          $RdpUser = "FabricAdmin"; $RdpPassword = "A123456!"
+          $ActiveMinutes = 330; $RelayAt = 330; $TotalMinutes = 335; $MaxRestarts = 5
+          $restarts = 0; $relayDone = $false; $endpoint = $null
+
+          function Send-Telegram([string]$Text) {
+            if ([string]::IsNullOrWhiteSpace($env:TELEGRAM_BOT_TOKEN)) { return }
+            try {
+              Invoke-RestMethod -Uri "https://api.telegram.org/bot$env:TELEGRAM_BOT_TOKEN/sendMessage" `
+                -Method Post -TimeoutSec 30 -Body @{
+                  chat_id=$env:TELEGRAM_CHAT_ID; text=$Text; parse_mode="HTML" } | Out-Null
+            } catch { Write-Host "⚠ Telegram send failed: $($_.Exception.Message)" }
+          }
+          function Start-Tunnel {
+            $a = @("tcp","3389","--config","`"$ngrokYml`"","--log","`"$ngrokLog`"","--log-format","json")
+            if ($env:NGROK_TCP_ADDR) { $a += "--url"; $a += "tcp://$env:NGROK_TCP_ADDR" }
+            return (Start-Process $ngrokExe -ArgumentList $a -PassThru -WindowStyle Hidden)
+          }
+          function Get-Endpoint {
+            for ($i=0; $i -lt 24; $i++) {                      # primary: local inspection API
+              Start-Sleep -Seconds 5
+              try {
+                $t = Invoke-RestMethod "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 5
+                $u = $t.tunnels | Where-Object { $_.proto -eq "tcp" } | Select-Object -First 1
+                if ($u.public_url) { return ($u.public_url -replace "^tcp://","") }
+              } catch { }
+              if ($proc.HasExited) { throw "ngrok exited prematurely — check authtoken" }
+            }
+            if (Test-Path $ngrokLog) {                         # fallback: log regex
+              $m = Select-String -Path $ngrokLog -Pattern 'url=tcp://([^\s"]+)' | Select-Object -Last 1
+              if ($m) { return $m.Matches[0].Groups[1].Value }
+            }
+            throw "Tunnel endpoint not detected within 120s"
+          }
+
+          # ── Bring fortress online ──
+          $proc = Start-Tunnel
+          $endpoint = Get-Endpoint
+          Write-Host "✔ RDP endpoint: $endpoint"
+
+          Send-Telegram @"
+⚡ <b>Fusion V2 — Instance $env:INSTANCE_ID ONLINE</b>
+
+🌐 RDP: <code>$endpoint</code>
+👤 User: <code>$RdpUser</code>
+🔑 Pass: <code>$RdpPassword</code>
+🖥️ Tier: $env:EFFECTIVE_TIER
+⏱️ Active: $ActiveMinutes min
+🆔 Run: $env:DEPLOYMENT_ID
+"@
+
+          try {
+            "## ⚡ Fusion V2 — Instance $env:INSTANCE_ID ONLINE`n| Key | Value |`n|---|---|`n| 🌐 RDP | ``$endpoint`` |`n| 👤 User | ``$RdpUser`` |`n| 🔑 Pass | ``$RdpPassword`` |`n| 🖥️ Tier | $env:EFFECTIVE_TIER |`n| ⏱️ Window | $ActiveMinutes min |" |
+              Out-File $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          } catch { }
+
+          # ── Optional headless payload (Base64) ──
+          if (-not [string]::IsNullOrWhiteSpace($env:RAW_PAYLOAD)) {
+            Write-Host "🚦 Executing decoded payload..."
+            $payloadPath = Join-Path $env:TEMP ("payload_{0}.ps1" -f $env:DEPLOYMENT_ID)
+            try {
+              $decoded = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($env:RAW_PAYLOAD))
+              Set-Content -Path $payloadPath -Value $decoded -Encoding UTF8
+              & powershell.exe -ExecutionPolicy Bypass -File $payloadPath
+              if ($LASTEXITCODE -ne 0 -and $env:FAIL_FAST_INPUT -eq 'true') {
+                throw "Payload failed with exit code $LASTEXITCODE (FAIL_FAST=true)"
+              }
+            } catch {
+              Write-Host "❌ Payload error: $($_.Exception.Message)"
+              Send-Telegram "❌ <b>Instance $env:INSTANCE_ID payload failed:</b> $($_.Exception.Message)"
+              if ($env:FAIL_FAST_INPUT -eq 'true') { throw }
+            } finally {
+              Remove-Item $payloadPath -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          # ── Sentinel mission loop with tunnel watchdog ──
+          $startTime = Get-Date
+          Write-Host "🛡️ Sentinel engaged — mission clock started"
+          while (((Get-Date) - $startTime).TotalMinutes -lt $TotalMinutes) {
+            Start-Sleep -Seconds 60
+            $elapsed = [int]((Get-Date) - $startTime).TotalMinutes
+
+            # Watchdog: detect tunnel death, auto-reconnect, re-alert
+            if ($proc.HasExited) {
+              if ($restarts -ge $MaxRestarts) {
+                Write-Host "❌ Tunnel unrecoverable after $MaxRestarts restarts — ending mission"
+                Send-Telegram "🚨 <b>Instance $env:INSTANCE_ID tunnel DEAD — mission aborted</b>"
+                exit 1
+              }
+              $restarts++
+              Write-Host "⚠ Tunnel down — watchdog restart #$restarts"
+              $proc = Start-Tunnel
+              try {
+                $endpoint = Get-Endpoint
+                Send-Telegram "♻️ <b>Instance $env:INSTANCE_ID tunnel re-established</b>`n🌐 RDP: <code>$endpoint</code>"
+              } catch { Write-Host "⚠ Watchdog restart failed: $($_.Exception.Message)" }
+            }
+
+            if ($elapsed % 15 -eq 0) { Write-Host "💓 Heartbeat — ${elapsed}m elapsed, $($TotalMinutes-$elapsed)m left" }
+
+            # Relay: dispatch next instance carrying profile context
+            if ($elapsed -ge $RelayAt -and -not $relayDone) {
+              $relayDone = $true
+              $next = [int]$env:INSTANCE_ID + 1
+              for ($r=1; $r -le 3; $r++) {
+                try {
+                  gh api "repos/$env:REPO/dispatches" -X POST `
+                    -F "event_type=fusion-relay" `
+                    -F "client_payload[instance]=$next" `
+                    -F "client_payload[profile]=$env:EFFECTIVE_TIER" | Out-Null
+                  Write-Host "✋ Relay dispatched — Instance $next queued on '$env:EFFECTIVE_TIER'"; break
+                } catch { if ($r -eq 3) { Write-Host "⚠ Relay failed" } else { Start-Sleep ($r*2) } }
+              }
+            }
+          }
+
+          # ── Mission teardown ──
+          Get-Process ngrok -ErrorAction SilentlyContinue | Stop-Process -Force
+          Disable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          $dur = [int]((Get-Date) - $startTime).TotalMinutes
+          Send-Telegram @"
+🏁 <b>Fusion V2 — Instance $env:INSTANCE_ID OFFLINE</b>
+
+✋ Relay: Instance $([int]$env:INSTANCE_ID+1) queued ($env:EFFECTIVE_TIER)
+⏱️ Duration: $dur min | Watchdog restarts: $restarts
+🔋 SHAHZAIB-YT
+"@
+          Write-Host "🏁 Mission complete — Instance $env:INSTANCE_ID signing off."
+
+      - name: 📤 Upload Deployment Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fusion-${{ env.EFFECTIVE_TIER }}-instance-${{ env.INSTANCE_ID }}-logs
+          path: C:\Fusion
+          if-no-files-found: ignore
+          retention-days: 7
+          compression-level: 9
+
+      - name: 🧹 Secure Teardown & Ephemeral Erasure
+        if: always()
+        run: |
+          if (Test-Path $env:FAST_SCRATCH) {
+            Remove-Item $env:FAST_SCRATCH -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          [System.GC]::Collect()
+          Write-Host "✔ Scratch purged. Pipeline finalized cleanly."
