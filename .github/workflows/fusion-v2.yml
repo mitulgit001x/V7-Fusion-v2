@@ -59,7 +59,6 @@ jobs:
       RAW_PAYLOAD: ${{ github.event.inputs.COMMAND_PAYLOAD }}
       FAIL_FAST_INPUT: ${{ github.event.inputs.FAIL_FAST }}
       NGROK_SHAHZAIB: ${{ secrets.NGROK_SHAHZAIB }}
-      NGROK_TCP_ADDR: ${{ secrets.NGROK_TCP_ADDR }}
       NGROK_ALLOW_IP: ${{ secrets.NGROK_ALLOW_IP }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -218,18 +217,13 @@ jobs:
           Write-Host "Verifying ngrok.exe signature..."
           $sig = Get-AuthenticodeSignature $ngrokExe
           Write-Host "Signature Status : $($sig.Status)"
-          Write-Host "Signature Type   : $($sig.SignatureType)"
           if ($sig.SignerCertificate) {
             Write-Host "Signer           : $($sig.SignerCertificate.Subject)"
-          } else {
-            Write-Host "Signer           : (none)"
           }
           if ($sig.Status -eq "Valid" -and $sig.SignerCertificate -and $sig.SignerCertificate.Subject -match "ngrok") {
             Write-Host "ngrok.exe signature fully verified."
-          } elseif ($sig.Status -eq "Valid") {
-            Write-Host "Signature valid but signer unexpected: $($sig.SignerCertificate.Subject)"
           } else {
-            Write-Host "Signature status: $($sig.Status) - proceeding with caution (may be expected on ARM64 emulation)"
+            Write-Host "Signature status: $($sig.Status) - proceeding (expected on ARM64 emulation)"
           }
 
           Write-Host "Writing ngrok configuration..."
@@ -273,14 +267,21 @@ jobs:
             } catch { Write-Host "Telegram send failed: $($_.Exception.Message)" }
           }
 
-          function Start-Tunnel {
-            Write-Host "Starting ngrok tunnel..."
-            $a = @("tcp","3389","--config","`"$ngrokYml`"","--log","`"$ngrokLog`"","--log-format","json")
-            if ($env:NGROK_TCP_ADDR) {
-              $a += "--url"
-              $a += "tcp://$env:NGROK_TCP_ADDR"
-              Write-Host "Using reserved address: $env:NGROK_TCP_ADDR"
+          function Get-NgrokFatalError {
+            if (Test-Path $ngrokLog) {
+              $fatal = Select-String -Path $ngrokLog -Pattern 'ERR_NGROK_(\d+)' | Select-Object -Last 1
+              if ($fatal) {
+                $tail = (Get-Content $ngrokLog -Tail 5) -join "`n"
+                return $tail
+              }
             }
+            return $null
+          }
+
+          function Start-Tunnel {
+            Write-Host "Starting ngrok tunnel (random free endpoint)..."
+            $a = @("tcp","3389","--config","`"$ngrokYml`"","--log","`"$ngrokLog`"","--log-format","json")
+            if (Test-Path $ngrokLog) { Remove-Item $ngrokLog -Force -ErrorAction SilentlyContinue }
             $p = Start-Process $ngrokExe -ArgumentList $a -PassThru -WindowStyle Hidden
             Write-Host "ngrok process started (PID: $($p.Id))"
             return $p
@@ -302,12 +303,14 @@ jobs:
               } catch { }
               if ($proc.HasExited) {
                 Write-Host "ngrok process exited unexpectedly."
-                if (Test-Path $ngrokLog) {
-                  Write-Host "--- ngrok log tail ---"
-                  Get-Content $ngrokLog -Tail 20 | ForEach-Object { Write-Host $_ }
-                  Write-Host "--- end ngrok log ---"
+                $fatalInfo = Get-NgrokFatalError
+                if ($fatalInfo) {
+                  Write-Host "--- FATAL NGROK ERROR ---"
+                  Write-Host $fatalInfo
+                  Write-Host "--- END FATAL ERROR ---"
+                  throw "ngrok fatal error - see log above"
                 }
-                throw "ngrok exited prematurely - check authtoken and log above"
+                throw "ngrok exited prematurely without error details"
               }
             }
             if (Test-Path $ngrokLog) {
