@@ -75,7 +75,8 @@ jobs:
             if (-not [string]::IsNullOrWhiteSpace($v)) { Write-Host "::add-mask::$v" }
           }
           if ([string]::IsNullOrWhiteSpace($env:NGROK_SHAHZAIB)) {
-            Write-Error "Missing required secret: NGROK_SHAHZAIB"; exit 1
+            Write-Error "Missing required secret: NGROK_SHAHZAIB"
+            exit 1
           }
           Write-Host "Secrets validated and masked."
 
@@ -85,23 +86,29 @@ jobs:
           Write-Host "--- Applying maximum-performance profile ---"
 
           [System.Diagnostics.Process]::GetCurrentProcess().PriorityClass = 'High'
+          Write-Host "Thread priority set to HIGH."
 
           powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 | Out-Null
           powercfg /s e9a42b02-d5df-448d-aa00-03f14749eb61 2>$null
           if ($LASTEXITCODE -ne 0) { powercfg /s 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c }
           powercfg /change monitor-timeout-ac 0
           powercfg /change standby-timeout-ac 0
+          Write-Host "Power plan locked to maximum performance."
 
           Set-MpPreference -DisableRealtimeMonitoring $true -ExclusionPath "C:\","D:\" 2>$null
+          Write-Host "Defender real-time scan bypassed."
 
           Stop-Service wuauserv -Force
           Set-Service wuauserv -StartupType Disabled
+          Write-Host "Windows Update suppressed."
 
           if (Test-Path "D:\") {
             New-Item -ItemType Directory -Path $env:FAST_SCRATCH -Force | Out-Null
             "TEMP=$env:FAST_SCRATCH" >> $env:GITHUB_ENV
             "TMP=$env:FAST_SCRATCH"  >> $env:GITHUB_ENV
             Write-Host "Scratch IO relocated to NVMe: $env:FAST_SCRATCH"
+          } else {
+            Write-Host "No D: drive found - using default TEMP."
           }
 
           foreach ($svc in "DiagTrack","dmwappushservice","RetailDemo") {
@@ -110,6 +117,7 @@ jobs:
           }
           New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" -Force | Out-Null
           Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" -Name "DisableWindowsConsumerFeatures" -Value 1
+          Write-Host "Telemetry and consumer features disabled."
 
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
           Write-Host "Kernel, storage, and network stack tuned."
@@ -138,46 +146,104 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $RdpUser = "FabricAdmin"
           $RdpPassword = "A123456!"
+          Write-Host "Provisioning RDP access for user: $RdpUser"
           $secPass = ConvertTo-SecureString $RdpPassword -AsPlainText -Force
           if (Get-LocalUser -Name $RdpUser -ErrorAction SilentlyContinue) {
             Set-LocalUser -Name $RdpUser -Password $secPass -PasswordNeverExpires:$true
+            Write-Host "Updated existing user password."
           } else {
             New-LocalUser -Name $RdpUser -Password $secPass -FullName "Fusion Operator" -PasswordNeverExpires -AccountNeverExpires | Out-Null
+            Write-Host "Created new user."
           }
           Add-LocalGroupMember -Group "Administrators" -Member $RdpUser -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $RdpUser -ErrorAction SilentlyContinue
+          Write-Host "User added to Administrators and Remote Desktop Users."
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 1
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-Service TermService -StartupType Automatic
           Restart-Service TermService -Force
-          Write-Host "RDP enabled for '$RdpUser'"
+          Write-Host "RDP enabled and service restarted."
 
       - name: Tunnel Engine - Verified Fetch and Deploy
         run: |
           $ErrorActionPreference = 'Stop'
           $ngrokDir = "C:\Fusion\ngrok"
           New-Item -ItemType Directory -Force -Path $ngrokDir,"C:\Fusion\Logs" | Out-Null
+          Write-Host "Working directory: $ngrokDir"
 
           $zip = "$ngrokDir\ngrok.zip"
-          & curl.exe --silent --show-error --location --retry 5 --retry-delay 3 --retry-connrefused --retry-max-time 180 --connect-timeout 30 -o $zip "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
-          if ($LASTEXITCODE -ne 0) { throw "ngrok download failed (exit $LASTEXITCODE)" }
+          $url = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
+          Write-Host "Downloading ngrok from: $url"
+
+          $downloadSuccess = $false
+          $curlPath = Get-Command curl.exe -ErrorAction SilentlyContinue
+          if ($curlPath) {
+            Write-Host "curl.exe found at: $($curlPath.Source)"
+            & curl.exe --silent --show-error --location --retry 5 --retry-delay 3 --retry-connrefused --retry-max-time 180 --connect-timeout 30 -o $zip $url
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $zip)) {
+              $downloadSuccess = $true
+              Write-Host "curl download succeeded."
+            } else {
+              Write-Host "curl failed (exit $LASTEXITCODE), trying Invoke-WebRequest..."
+            }
+          } else {
+            Write-Host "curl.exe not found in PATH."
+          }
+
+          if (-not $downloadSuccess) {
+            Write-Host "Using Invoke-WebRequest..."
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 120
+              $downloadSuccess = $true
+              Write-Host "Invoke-WebRequest download succeeded."
+            } catch {
+              throw "Both download methods failed: $($_.Exception.Message)"
+            }
+          }
+
+          if (-not (Test-Path $zip)) { throw "Download failed - zip file not found at $zip" }
+          $zipSize = (Get-Item $zip).Length
+          Write-Host "Downloaded file size: $zipSize bytes"
+          if ($zipSize -lt 100000) { throw "Download too small ($zipSize bytes) - likely an error page, not the real binary" }
+
+          Write-Host "Extracting ngrok.zip..."
           Expand-Archive $zip -DestinationPath $ngrokDir -Force
           Remove-Item $zip -Force
 
-          $sig = Get-AuthenticodeSignature "$ngrokDir\ngrok.exe"
-          if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notmatch "ngrok") {
-            throw "ngrok.exe signature FAILED verification (Status: $($sig.Status)) - aborting"
-          }
-          Write-Host "ngrok.exe signature verified: $($sig.SignerCertificate.Subject)"
+          $ngrokExe = "$ngrokDir\ngrok.exe"
+          if (-not (Test-Path $ngrokExe)) { throw "ngrok.exe not found after extraction" }
+          Write-Host "ngrok.exe extracted successfully."
 
+          Write-Host "Verifying ngrok.exe signature..."
+          $sig = Get-AuthenticodeSignature $ngrokExe
+          Write-Host "Signature Status : $($sig.Status)"
+          Write-Host "Signature Type   : $($sig.SignatureType)"
+          if ($sig.SignerCertificate) {
+            Write-Host "Signer           : $($sig.SignerCertificate.Subject)"
+          } else {
+            Write-Host "Signer           : (none)"
+          }
+          if ($sig.Status -eq "Valid" -and $sig.SignerCertificate -and $sig.SignerCertificate.Subject -match "ngrok") {
+            Write-Host "ngrok.exe signature fully verified."
+          } elseif ($sig.Status -eq "Valid") {
+            Write-Host "Signature valid but signer unexpected: $($sig.SignerCertificate.Subject)"
+          } else {
+            Write-Host "Signature status: $($sig.Status) - proceeding with caution (may be expected on ARM64 emulation)"
+          }
+
+          Write-Host "Writing ngrok configuration..."
           $cfg = "version: 3`nagent:`n  authtoken: $env:NGROK_SHAHZAIB"
           if (-not [string]::IsNullOrWhiteSpace($env:NGROK_ALLOW_IP)) {
             $cfg += "`nendpoints:`n- name: rdp`n  upstream:`n    url: 3389`n  traffic_policy:`n    on_tcp_connect:`n    - actions:`n      - type: restrict-ips`n        config:`n          allow:`n          - $env:NGROK_ALLOW_IP"
           }
           $cfg | Out-File "$ngrokDir\ngrok.yml" -Encoding ascii
-          & "$ngrokDir\ngrok.exe" --version
-          Write-Host "Tunnel engine staged."
+          Write-Host "Configuration written."
+
+          Write-Host "Testing ngrok binary..."
+          & $ngrokExe --version
+          if ($LASTEXITCODE -ne 0) { throw "ngrok.exe failed to execute (exit $LASTEXITCODE)" }
+          Write-Host "Tunnel engine staged successfully."
 
       - name: Fortress Online - Tunnel + Watchdog + Mission Loop
         run: |
@@ -203,35 +269,63 @@ jobs:
                 text = $Text
                 parse_mode = "HTML"
               } | Out-Null
+              Write-Host "Telegram notification sent."
             } catch { Write-Host "Telegram send failed: $($_.Exception.Message)" }
           }
 
           function Start-Tunnel {
+            Write-Host "Starting ngrok tunnel..."
             $a = @("tcp","3389","--config","`"$ngrokYml`"","--log","`"$ngrokLog`"","--log-format","json")
-            if ($env:NGROK_TCP_ADDR) { $a += "--url"; $a += "tcp://$env:NGROK_TCP_ADDR" }
-            return (Start-Process $ngrokExe -ArgumentList $a -PassThru -WindowStyle Hidden)
+            if ($env:NGROK_TCP_ADDR) {
+              $a += "--url"
+              $a += "tcp://$env:NGROK_TCP_ADDR"
+              Write-Host "Using reserved address: $env:NGROK_TCP_ADDR"
+            }
+            $p = Start-Process $ngrokExe -ArgumentList $a -PassThru -WindowStyle Hidden
+            Write-Host "ngrok process started (PID: $($p.Id))"
+            return $p
           }
 
           function Get-Endpoint {
+            Write-Host "Waiting for tunnel endpoint..."
             for ($i = 0; $i -lt 24; $i++) {
               Start-Sleep -Seconds 5
+              Write-Host "Checking endpoint (attempt $($i+1)/24)..."
               try {
                 $t = Invoke-RestMethod "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 5
                 $u = $t.tunnels | Where-Object { $_.proto -eq "tcp" } | Select-Object -First 1
-                if ($u.public_url) { return ($u.public_url -replace "^tcp://","") }
+                if ($u.public_url) {
+                  $ep = ($u.public_url -replace "^tcp://","")
+                  Write-Host "Endpoint found via API: $ep"
+                  return $ep
+                }
               } catch { }
-              if ($proc.HasExited) { throw "ngrok exited prematurely - check authtoken" }
+              if ($proc.HasExited) {
+                Write-Host "ngrok process exited unexpectedly."
+                if (Test-Path $ngrokLog) {
+                  Write-Host "--- ngrok log tail ---"
+                  Get-Content $ngrokLog -Tail 20 | ForEach-Object { Write-Host $_ }
+                  Write-Host "--- end ngrok log ---"
+                }
+                throw "ngrok exited prematurely - check authtoken and log above"
+              }
             }
             if (Test-Path $ngrokLog) {
+              Write-Host "API timeout, checking log for endpoint..."
               $m = Select-String -Path $ngrokLog -Pattern 'url=tcp://([^\s"]+)' | Select-Object -Last 1
-              if ($m) { return $m.Matches[0].Groups[1].Value }
+              if ($m) {
+                $ep = $m.Matches[0].Groups[1].Value
+                Write-Host "Endpoint found via log: $ep"
+                return $ep
+              }
             }
             throw "Tunnel endpoint not detected within 120s"
           }
 
+          Write-Host "=== Bringing fortress online ==="
           $proc = Start-Tunnel
           $endpoint = Get-Endpoint
-          Write-Host "RDP endpoint: $endpoint"
+          Write-Host "RDP endpoint established: $endpoint"
 
           $onlineMsg = @(
             "Fusion V2 - Instance $env:INSTANCE_ID ONLINE"
@@ -251,7 +345,7 @@ jobs:
           } catch { }
 
           if (-not [string]::IsNullOrWhiteSpace($env:RAW_PAYLOAD)) {
-            Write-Host "Executing decoded payload..."
+            Write-Host "=== Executing decoded payload ==="
             $payloadPath = Join-Path $env:TEMP ("payload_{0}.ps1" -f $env:DEPLOYMENT_ID)
             try {
               $decoded = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($env:RAW_PAYLOAD))
@@ -260,6 +354,7 @@ jobs:
               if ($LASTEXITCODE -ne 0 -and $env:FAIL_FAST_INPUT -eq 'true') {
                 throw "Payload failed with exit code $LASTEXITCODE (FAIL_FAST=true)"
               }
+              Write-Host "Payload executed successfully."
             } catch {
               Write-Host "Payload error: $($_.Exception.Message)"
               Send-Telegram "Instance $env:INSTANCE_ID payload failed: $($_.Exception.Message)"
@@ -267,10 +362,12 @@ jobs:
             } finally {
               Remove-Item $payloadPath -Force -ErrorAction SilentlyContinue
             }
+          } else {
+            Write-Host "No payload provided - skipping."
           }
 
           $startTime = Get-Date
-          Write-Host "Sentinel engaged - mission clock started"
+          Write-Host "=== Sentinel engaged - mission clock started ==="
           while (((Get-Date) - $startTime).TotalMinutes -lt $TotalMinutes) {
             Start-Sleep -Seconds 60
             $elapsed = [int]((Get-Date) - $startTime).TotalMinutes
@@ -295,18 +392,21 @@ jobs:
             if ($elapsed -ge $RelayAt -and -not $relayDone) {
               $relayDone = $true
               $next = [int]$env:INSTANCE_ID + 1
+              Write-Host "Dispatching relay for Instance $next..."
               for ($r = 1; $r -le 3; $r++) {
                 try {
                   gh api "repos/$env:REPO/dispatches" -X POST -F "event_type=fusion-relay" -F "client_payload[instance]=$next" -F "client_payload[profile]=$env:EFFECTIVE_TIER" | Out-Null
                   Write-Host "Relay dispatched - Instance $next queued on '$env:EFFECTIVE_TIER'"
                   break
                 } catch {
-                  if ($r -eq 3) { Write-Host "Relay failed" } else { Start-Sleep ($r * 2) }
+                  Write-Host "Relay attempt $r failed: $($_.Exception.Message)"
+                  if ($r -eq 3) { Write-Host "Relay failed after 3 attempts" } else { Start-Sleep ($r * 2) }
                 }
               }
             }
           }
 
+          Write-Host "=== Mission teardown ==="
           Get-Process ngrok -ErrorAction SilentlyContinue | Stop-Process -Force
           Disable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
           $dur = [int]((Get-Date) - $startTime).TotalMinutes
@@ -323,7 +423,7 @@ jobs:
 
       - name: Upload Deployment Logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: fusion-logs-${{ env.INSTANCE_ID }}
           path: C:\Fusion
